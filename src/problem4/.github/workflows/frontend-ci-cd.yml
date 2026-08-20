@@ -1,0 +1,135 @@
+# Frontend CI/CD — static SPA → S3 + CloudFront
+#
+# In a real repository this file would live at:
+#   .github/workflows/frontend-ci-cd.yml
+# It is submitted under src/problem4/ as the challenge deliverable.
+
+name: Frontend CI/CD
+
+on:
+  pull_request:
+    paths:
+      - "frontend/**"
+      - ".github/workflows/frontend-ci-cd.yml"
+  push:
+    branches: [main]
+    paths:
+      - "frontend/**"
+      - ".github/workflows/frontend-ci-cd.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: frontend-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  NODE_VERSION: "20"
+  AWS_REGION: ${{ vars.AWS_REGION || 'ap-southeast-1' }}
+
+jobs:
+  validate:
+    name: Install, lint, test, build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Production build
+        run: npm run build
+
+      - name: Upload build (PR artifact for review)
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist-pr-${{ github.event.pull_request.number }}
+          path: frontend/dist
+          retention-days: 7
+
+  deploy:
+    name: Deploy to S3 + invalidate CloudFront
+    needs: validate
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Production build
+        run: npm run build
+        env:
+          # Injected at build time; never commit secrets
+          VITE_API_BASE_URL: ${{ vars.FRONTEND_API_BASE_URL }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-frontend-${{ github.run_id }}
+
+      - name: Sync hashed assets (long cache)
+        env:
+          BUCKET: ${{ secrets.FRONTEND_S3_BUCKET }}
+        run: |
+          aws s3 sync dist/ "s3://${BUCKET}/" \
+            --delete \
+            --cache-control "public,max-age=31536000,immutable" \
+            --exclude "index.html" \
+            --exclude "*.html"
+
+      - name: Sync HTML (no-cache)
+        env:
+          BUCKET: ${{ secrets.FRONTEND_S3_BUCKET }}
+        run: |
+          aws s3 sync dist/ "s3://${BUCKET}/" \
+            --cache-control "public,max-age=0,must-revalidate" \
+            --exclude "*" \
+            --include "*.html"
+
+      - name: Invalidate CloudFront
+        env:
+          DISTRIBUTION_ID: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}
+        run: |
+          INVALIDATION_ID=$(aws cloudfront create-invalidation \
+            --distribution-id "$DISTRIBUTION_ID" \
+            --paths "/index.html" "/" \
+            --query 'Invalidation.Id' \
+            --output text)
+          echo "Invalidation ${INVALIDATION_ID} created"

@@ -1,0 +1,210 @@
+# Backend CI/CD — HTTP API → EC2
+#
+# In a real repository this file would live at:
+#   .github/workflows/backend-ci-cd.yml
+# It is submitted under src/problem4/ as the challenge deliverable.
+
+name: Backend CI/CD
+
+on:
+  pull_request:
+    paths:
+      - "backend/**"
+      - ".github/workflows/backend-ci-cd.yml"
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - ".github/workflows/backend-ci-cd.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # required for AWS OIDC
+
+concurrency:
+  group: backend-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  NODE_VERSION: "20"
+  ARTIFACT_NAME: backend-app
+  AWS_REGION: ${{ vars.AWS_REGION || 'ap-southeast-1' }}
+
+jobs:
+  validate:
+    name: Lint, test, security
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Unit tests
+        run: npm test -- --coverage
+
+      - name: Audit dependencies
+        run: npm audit --audit-level=high
+
+      # Optional: enable when a CodeQL/Snyk org integration exists
+      # - name: SAST placeholder
+      #   run: echo "Run SAST / container scan in org-standard job"
+
+  build:
+    name: Build versioned artifact
+    needs: validate
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Version metadata
+        id: meta
+        run: |
+          VERSION="${GITHUB_SHA::12}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$VERSION" > dist/VERSION
+
+      - name: Package artifact
+        run: |
+          tar -czf "../${{ env.ARTIFACT_NAME }}-${{ steps.meta.outputs.version }}.tar.gz" -C dist .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}-${{ steps.meta.outputs.version }}
+          path: ${{ env.ARTIFACT_NAME }}-${{ steps.meta.outputs.version }}.tar.gz
+          retention-days: 14
+          if-no-files-found: error
+
+  deploy:
+    name: Deploy to EC2
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-backend-${{ github.run_id }}
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}-${{ needs.build.outputs.version }}
+          path: ./artifact
+
+      - name: Publish immutable artifact to S3
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          BUCKET: ${{ secrets.BACKEND_ARTIFACT_BUCKET }}
+        run: |
+          KEY="backend/${VERSION}/${{ env.ARTIFACT_NAME }}-${VERSION}.tar.gz"
+          aws s3 cp "./artifact/${{ env.ARTIFACT_NAME }}-${VERSION}.tar.gz" "s3://${BUCKET}/${KEY}"
+          echo "ARTIFACT_S3_URI=s3://${BUCKET}/${KEY}" >> "$GITHUB_ENV"
+
+      - name: Deploy via SSM to EC2
+        id: deploy
+        env:
+          INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+          HEALTH_URL: ${{ secrets.BACKEND_HEALTH_URL }}
+          SERVICE_NAME: backend-api
+          PREVIOUS_LINK: /opt/backend/current
+        run: |
+          set -euo pipefail
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy backend ${{ needs.build.outputs.version }}" \
+            --parameters commands='[
+              "set -euo pipefail",
+              "VERSION='"'"'${{ needs.build.outputs.version }}'"'"'",
+              "ARTIFACT='"'"'"${ARTIFACT_S3_URI}"'"'"'",
+              "ROOT=/opt/backend",
+              "RELEASE=\"$ROOT/releases/$VERSION\"",
+              "mkdir -p \"$RELEASE\" \"$ROOT/releases\"",
+              "aws s3 cp \"$ARTIFACT\" /tmp/backend-artifact.tgz",
+              "tar -xzf /tmp/backend-artifact.tgz -C \"$RELEASE\"",
+              "ln -sfn \"$RELEASE\" \"$ROOT/current.new\"",
+              "PREV=$(readlink -f '"'"'/opt/backend/current'"'"' || true)",
+              "mv -Tf \"$ROOT/current.new\" '"'"'/opt/backend/current'"'"'",
+              "systemctl restart '"'"'backend-api'"'"'",
+              "echo \"PREVIOUS=$PREV\""
+            ]' \
+            --query 'Command.CommandId' \
+            --output text)
+
+          echo "command_id=${COMMAND_ID}" >> "$GITHUB_OUTPUT"
+          aws ssm wait command-executed --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID"
+
+      - name: Health check
+        id: health
+        env:
+          HEALTH_URL: ${{ secrets.BACKEND_HEALTH_URL }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 20); do
+            if curl -fsS --max-time 5 "$HEALTH_URL" | grep -qi ok; then
+              echo "Healthy"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "Health check failed"
+          exit 1
+
+      - name: Rollback on failure
+        if: failure() && steps.deploy.outcome == 'success'
+        env:
+          INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+        run: |
+          set -euo pipefail
+          aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters commands='[
+              "set -euo pipefail",
+              "cd /opt/backend/releases",
+              "PREV=$(ls -1dt */ | sed -n \"2p\" | tr -d \"/\")",
+              "test -n \"$PREV\"",
+              "ln -sfn \"/opt/backend/releases/$PREV\" /opt/backend/current",
+              "systemctl restart backend-api"
+            ]'
+          echo "Rolled back to previous release"
